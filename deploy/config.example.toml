@@ -1,0 +1,21 @@
+[server]
+bind = "0.0.0.0:8080"
+
+[database]
+# Prefer the DATABASE_URL env var; this is here only to document the field.
+url = "postgres://gear5:gear5@localhost:5432/gear5"
+max_connections = 16
+
+[images]
+dir = "/var/lib/gear5/images"
+
+[scrape]
+enabled = true
+run_at_startup = false
+cron_hour_utc = 4
+concurrency = 4
+jitter_ms_min = 250
+jitter_ms_max = 500
+user_agent = "gear5-rs/0.1 (+contact-on-request)"
+stale_after_hours = 36
+base_url = "https://en.onepiece-cardgame.com/cardlist/"

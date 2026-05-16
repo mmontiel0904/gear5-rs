@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+.env
+.env.local
+*.swp
+.DS_Store
+
+# Local scrape artifacts
+/data
+/var
+/images

@@ -1,0 +1,29 @@
+[Unit]
+Description=gear5-rs API + embedded scraper
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gear5
+Group=gear5
+EnvironmentFile=/etc/gear5/gear5.env
+ExecStart=/usr/local/bin/gear5-api
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gear5
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
