@@ -11,6 +11,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub images: ImagesConfig,
     pub scrape: ScrapeConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,10 +33,22 @@ pub struct DatabaseConfig {
     pub url: String,
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    #[serde(default = "default_statement_timeout_ms")]
+    pub statement_timeout_ms: i64,
+    #[serde(default = "default_idle_tx_timeout_ms")]
+    pub idle_tx_timeout_ms: i64,
 }
 
 fn default_max_connections() -> u32 {
     16
+}
+
+fn default_statement_timeout_ms() -> i64 {
+    10_000
+}
+
+fn default_idle_tx_timeout_ms() -> i64 {
+    30_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +75,38 @@ pub struct ScrapeConfig {
     pub user_agent: String,
     pub stale_after_hours: i64,
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: usize,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            cache_capacity: default_cache_capacity(),
+            cache_ttl_secs: default_cache_ttl_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
+        }
+    }
+}
+
+fn default_cache_capacity() -> usize {
+    10_000
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    30
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ScrapeConfig {

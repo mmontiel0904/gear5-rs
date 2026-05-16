@@ -5,6 +5,17 @@ bind = "0.0.0.0:8080"
 # Prefer the DATABASE_URL env var; this is here only to document the field.
 url = "postgres://gear5:gear5@localhost:5432/gear5"
 max_connections = 16
+# Per-session SET on connect. Kills runaway queries before they pin pool slots.
+statement_timeout_ms = 10000
+idle_tx_timeout_ms = 30000
+
+[auth]
+# Token-verification cache. Each hit skips an argon2id verify (~50-100ms saved).
+# Cache key is sha256(plaintext); entries expire after `cache_ttl_secs`.
+cache_capacity = 10000
+cache_ttl_secs = 30
+# Per-request timeout applied to every route via tower-http TimeoutLayer.
+request_timeout_secs = 30
 
 [images]
 dir = "/var/lib/gear5/images"

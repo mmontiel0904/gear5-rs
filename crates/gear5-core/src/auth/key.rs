@@ -9,9 +9,13 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const KEY_VISIBLE_PREFIX: &str = "op_live_";
+pub const KEY_VISIBLE_PREFIX: &str = "op_live_";
 const KEY_RANDOM_BYTES: usize = 32;
 const PREFIX_HEX_LEN: usize = 16;
+
+pub fn key_visible_prefix() -> &'static str {
+    KEY_VISIBLE_PREFIX
+}
 
 pub struct NewKeyInput {
     pub name: String,
@@ -37,7 +41,7 @@ fn encode_visible(bytes: &[u8]) -> String {
     format!("{KEY_VISIBLE_PREFIX}{body}")
 }
 
-fn lookup_prefix_for(plaintext: &str) -> String {
+pub fn lookup_prefix_for(plaintext: &str) -> String {
     let digest = Sha256::digest(plaintext.as_bytes());
     let mut hex = hex::encode(digest);
     hex.truncate(PREFIX_HEX_LEN);
@@ -119,8 +123,14 @@ pub async fn revoke_key(pool: &PgPool, id_or_prefix: &str) -> Result<ApiKey> {
     row.ok_or(Error::NotFound)
 }
 
-/// Bearer-token verification path. Returns the active row for the caller's plaintext key, or `InvalidApiKey`.
-pub async fn lookup_for_verify(pool: &PgPool, plaintext: &str) -> Result<ApiKey> {
+/// DB-only step of bearer-token verification.
+///
+/// Returns the active `api_keys` row whose lookup prefix matches `plaintext`. Does NOT run
+/// argon2 — callers (typically the API auth middleware) are expected to do that on a
+/// blocking thread, since argon2id with default params burns ~50–100 ms of CPU per check.
+///
+/// Returns `Error::InvalidApiKey` if no matching active row exists.
+pub async fn lookup_active_row_by_prefix(pool: &PgPool, plaintext: &str) -> Result<ApiKey> {
     if !plaintext.starts_with(KEY_VISIBLE_PREFIX) {
         return Err(Error::InvalidApiKey);
     }
@@ -138,7 +148,13 @@ pub async fn lookup_for_verify(pool: &PgPool, plaintext: &str) -> Result<ApiKey>
     .bind(&prefix)
     .fetch_optional(pool)
     .await?;
-    let row = row.ok_or(Error::InvalidApiKey)?;
+    row.ok_or(Error::InvalidApiKey)
+}
+
+/// Convenience: prefix lookup + sync argon2 verify in one call. Used by the CLI and tests.
+/// Production API code prefers `lookup_active_row_by_prefix` + a `spawn_blocking` verify.
+pub async fn lookup_for_verify(pool: &PgPool, plaintext: &str) -> Result<ApiKey> {
+    let row = lookup_active_row_by_prefix(pool, plaintext).await?;
     if !verify_secret(plaintext, &row.hash) {
         return Err(Error::InvalidApiKey);
     }

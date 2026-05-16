@@ -1,12 +1,14 @@
+use crate::auth_cache::AuthCache;
 use gear5_core::config::Config;
 use gear5_core::scraper::HttpClient;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use parking_lot::RwLock;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
@@ -18,14 +20,15 @@ pub struct AppState {
     pub http: HttpClient,
     pub limiters: Arc<RwLock<HashMap<Uuid, Arc<DirectLimiter>>>>,
     pub scrape_lock: Arc<tokio::sync::Mutex<()>>,
+    pub auth_cache: Arc<AuthCache>,
 }
 
 impl AppState {
     pub fn limiter_for(&self, id: Uuid, rpm: i32) -> Arc<DirectLimiter> {
-        if let Some(found) = self.limiters.read().unwrap().get(&id).cloned() {
+        if let Some(found) = self.limiters.read().get(&id).cloned() {
             return found;
         }
-        let mut w = self.limiters.write().unwrap();
+        let mut w = self.limiters.write();
         if let Some(found) = w.get(&id).cloned() {
             return found;
         }

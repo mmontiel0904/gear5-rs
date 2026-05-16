@@ -112,6 +112,10 @@ pub async fn revoke_key(
     Path(id_or_prefix): Path<String>,
 ) -> Result<Json<ApiKeyView>, ApiError> {
     let row = auth::revoke_key(&s.pool, &id_or_prefix).await?;
+    // Drop every cached auth entry so the revoked key (and any other entry that may
+    // have been edited in the same admin session) cannot continue to be served from the
+    // cache. Revocations are rare; the cost is one cheap LruCache::clear under a Mutex.
+    s.auth_cache.invalidate_all();
     Ok(Json(ApiKeyView::from(row)))
 }
 

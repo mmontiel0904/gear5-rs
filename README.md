@@ -52,6 +52,30 @@ Layered via `figment`:
 
 See `.env.example`.
 
+### Performance / safety knobs
+
+| Section / env | Default | What it does |
+|---|---|---|
+| `database.max_connections` / `GEAR5_DATABASE__MAX_CONNECTIONS` | 16 | sqlx pool size. Raise for >500 concurrent queries; Postgres caps total at 100 unless tuned. |
+| `database.statement_timeout_ms` / `GEAR5_DATABASE__STATEMENT_TIMEOUT_MS` | 10000 | `SET statement_timeout` on each fresh connection. Runaway queries abort instead of pinning a pool slot. Set to 0 to disable. |
+| `database.idle_tx_timeout_ms` / `GEAR5_DATABASE__IDLE_TX_TIMEOUT_MS` | 30000 | `SET idle_in_transaction_session_timeout`. Aborts forgotten transactions. |
+| `auth.cache_capacity` / `GEAR5_AUTH__CACHE_CAPACITY` | 10000 | LRU size of the in-process verify cache (keyed by `sha256(plaintext)`). |
+| `auth.cache_ttl_secs` / `GEAR5_AUTH__CACHE_TTL_SECS` | 30 | How long a successful verify stays cached. Bounds the staleness window for CLI-initiated revocations — see below. |
+| `auth.request_timeout_secs` / `GEAR5_AUTH__REQUEST_TIMEOUT_SECS` | 30 | Tower-HTTP request timeout. Slow clients are dropped with 408. |
+| `scrape.concurrency` / `GEAR5_SCRAPE__CONCURRENCY` | 4 | Cap on simultaneous outbound HTTP requests during a scrape (politeness, not throughput). |
+
+### Auth cache behaviour
+
+Every authenticated request normally pays one Argon2id verify (~50–100 ms). The cache makes repeat requests from the same client effectively free.
+
+- `DELETE /admin/keys/{id}` issued via the API invalidates **all** cached entries immediately. Revocation is instant for live clients.
+- `gear5 key revoke …` issued via the CLI cannot reach the running API's in-process cache. The revoked key keeps working for up to `auth.cache_ttl_secs` seconds (default 30 s). Prefer the API path for time-sensitive revocations.
+- Cache hits do **not** update `last_used_at` synchronously — the touch is fire-and-forget so it never blocks the response.
+
+### Graceful shutdown
+
+The server listens for `SIGINT` and `SIGTERM` and drains in-flight requests before exiting. `systemctl restart gear5-api` and `Ctrl-C` both clean up; in-flight `oha`/`wrk` runs report zero connection errors.
+
 ---
 
 ## Push to GitHub
@@ -157,11 +181,24 @@ sudo tee /etc/gear5/gear5.env > /dev/null <<EOF
 DATABASE_URL=postgres://gear5:$PG_PW@127.0.0.1:5432/gear5
 GEAR5_SERVER__BIND=127.0.0.1:8080
 GEAR5_IMAGES__DIR=/var/lib/gear5/images
+
+# Postgres safety
+GEAR5_DATABASE__MAX_CONNECTIONS=16
+GEAR5_DATABASE__STATEMENT_TIMEOUT_MS=10000
+GEAR5_DATABASE__IDLE_TX_TIMEOUT_MS=30000
+
+# Scrape scheduler
 GEAR5_SCRAPE__ENABLED=true
 GEAR5_SCRAPE__RUN_AT_STARTUP=true
 GEAR5_SCRAPE__CRON_HOUR_UTC=4
 GEAR5_SCRAPE__USER_AGENT=gear5-rs/0.1 (+contact-on-request)
 GEAR5_SCRAPE__STALE_AFTER_HOURS=36
+
+# Auth + request hardening
+GEAR5_AUTH__CACHE_CAPACITY=10000
+GEAR5_AUTH__CACHE_TTL_SECS=30
+GEAR5_AUTH__REQUEST_TIMEOUT_SECS=30
+
 RUST_LOG=info,gear5_api=info,gear5_core=info
 EOF
 sudo chown root:gear5 /etc/gear5/gear5.env
@@ -329,3 +366,16 @@ Only worth it if your VM already has a static public IP and a real TLS cert (e.g
 - `gear5 scrape status` — last 10 scrape runs with counts.
 - `gear5 key list` — issued API keys with last-used timestamps.
 - `gear5 key rotate <prefix>` — revoke + reissue with the same scopes.
+- `sudo systemctl restart gear5-api` — graceful drain; in-flight requests complete before the new process binds the port.
+- `oha -z 30s -c 200 -H "Authorization: Bearer <key>" http://127.0.0.1:8080/cards/OP01-001` — quick throughput probe. Expect cold ~10 RPS for ~100 ms (first argon2 verify), then thousands of RPS sustained from the warm verify cache.
+
+### Time-sensitive revocations
+
+Use the API path, not the CLI, when you need a key to stop working immediately:
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <admin-key>" \
+    http://127.0.0.1:8080/admin/keys/<id-or-prefix>
+```
+
+The API handler flushes the in-process verify cache as part of the revoke; the next request from the revoked key fails with 401. CLI-issued `gear5 key revoke` updates the DB row but the live API's cache continues to honour the key for up to `auth.cache_ttl_secs` seconds.
