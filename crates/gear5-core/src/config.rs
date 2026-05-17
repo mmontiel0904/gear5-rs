@@ -85,6 +85,10 @@ pub struct AuthConfig {
     pub cache_ttl_secs: u64,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// When true, `/docs` and `/api-doc/openapi.json` are open to anyone.
+    /// When false, both are gated behind an `admin`-scoped bearer key.
+    #[serde(default = "default_public_docs")]
+    pub public_docs: bool,
 }
 
 impl Default for AuthConfig {
@@ -93,6 +97,7 @@ impl Default for AuthConfig {
             cache_capacity: default_cache_capacity(),
             cache_ttl_secs: default_cache_ttl_secs(),
             request_timeout_secs: default_request_timeout_secs(),
+            public_docs: default_public_docs(),
         }
     }
 }
@@ -107,6 +112,10 @@ fn default_cache_ttl_secs() -> u64 {
 
 fn default_request_timeout_secs() -> u64 {
     30
+}
+
+fn default_public_docs() -> bool {
+    true
 }
 
 impl Default for ScrapeConfig {

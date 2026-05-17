@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct CardSet {
     pub id: String,
     pub source_series: String,
@@ -13,7 +14,7 @@ pub struct CardSet {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Card {
     pub code: String,
     pub set_id: String,
@@ -36,12 +37,13 @@ pub struct Card {
     pub image_path: String,
     pub image_version: String,
     #[serde(skip)]
+    #[schema(ignore)]
     pub payload_hash: Vec<u8>,
     pub first_seen_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct ScrapeRun {
     pub id: i64,
     pub started_at: DateTime<Utc>,
@@ -55,12 +57,13 @@ pub struct ScrapeRun {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct ApiKey {
     pub id: Uuid,
     pub name: String,
     pub prefix: String,
     #[serde(skip)]
+    #[schema(ignore)]
     pub hash: String,
     pub scopes: Vec<String>,
     pub rate_limit_rpm: i32,

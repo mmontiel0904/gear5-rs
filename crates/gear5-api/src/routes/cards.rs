@@ -1,37 +1,51 @@
 use crate::middleware::error::ApiError;
 use crate::middleware::ReadAuth;
+use crate::openapi::schemas::ErrorBody;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use gear5_core::model::Card;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
+use utoipa::{IntoParams, ToSchema};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CardFilter {
+    /// Filter to a specific set, e.g. `OP01`, `EB04`.
     pub set: Option<String>,
+    /// Match any card whose `colors` array contains this value (`Red`, `Green`, …).
     pub color: Option<String>,
+    /// LEADER / CHARACTER / EVENT / STAGE / DON.
     pub category: Option<String>,
+    /// L / C / UC / R / SR / SEC.
     pub rarity: Option<String>,
+    /// Match any card whose `features` array contains this value, e.g. `Straw Hat Crew`.
     pub feature: Option<String>,
     pub cost: Option<i32>,
     pub power_min: Option<i32>,
     pub power_max: Option<i32>,
+    /// Case-insensitive substring search across `name` and `effect_text`.
     pub q: Option<String>,
+    /// Opaque pagination cursor (the `next_cursor` from the previous page).
     pub cursor: Option<String>,
+    /// Page size. Clamped to `[1, 200]`.
+    #[param(minimum = 1, maximum = 200)]
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CardView {
     #[serde(flatten)]
     pub card: Card,
+    /// Server-relative URL for the cached card art.
     pub image_url: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CardListResponse {
     pub items: Vec<CardView>,
+    /// Pass this back as `cursor=` to fetch the next page. `null` when the page is the last.
     pub next_cursor: Option<String>,
     pub limit: i64,
 }
@@ -45,6 +59,22 @@ fn image_url(card: &Card) -> String {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/cards/{code}",
+    tag = "catalog",
+    security(("BearerAuth" = [])),
+    params(
+        ("code" = String, Path, description = "Card code, e.g. `OP01-001` or `OP01-003_p1` for alt arts"),
+    ),
+    responses(
+        (status = 200, body = CardView),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn get_card(
     State(s): State<AppState>,
     _: ReadAuth,
@@ -70,6 +100,19 @@ pub async fn get_card(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/cards",
+    tag = "catalog",
+    security(("BearerAuth" = [])),
+    params(CardFilter),
+    responses(
+        (status = 200, body = CardListResponse),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn list_cards(
     State(s): State<AppState>,
     _: ReadAuth,

@@ -1,5 +1,6 @@
 mod auth_cache;
 mod middleware;
+mod openapi;
 mod routes;
 mod scheduler;
 mod state;
@@ -21,8 +22,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth_cache::AuthCache;
+use crate::middleware::AdminAuth;
+use crate::openapi::ApiDoc;
 use crate::state::AppState;
 
 #[tokio::main]
@@ -66,6 +71,19 @@ async fn main() -> anyhow::Result<()> {
 
     let request_timeout = Duration::from_secs(cfg.auth.request_timeout_secs.max(1));
 
+    let openapi_spec = ApiDoc::openapi();
+    let docs_router: Router<AppState> = SwaggerUi::new("/docs")
+        .url("/api-doc/openapi.json", openapi_spec)
+        .into();
+    let docs_router = if cfg.auth.public_docs {
+        docs_router
+    } else {
+        docs_router.layer(axum::middleware::from_extractor_with_state::<
+            AdminAuth,
+            AppState,
+        >(state.clone()))
+    };
+
     let app = Router::new()
         .route("/health", get(routes::health::liveness))
         .route("/health/scrape", get(routes::health::scrape_health))
@@ -80,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/keys/:id", delete(routes::admin::revoke_key))
         .route("/admin/scrape/run", post(routes::admin::trigger_scrape))
+        .merge(docs_router)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,

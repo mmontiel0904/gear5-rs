@@ -1,5 +1,6 @@
 use crate::middleware::error::ApiError;
 use crate::middleware::ReadAuth;
+use crate::openapi::schemas::ErrorBody;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::State;
@@ -12,6 +13,27 @@ use sqlx::Row;
 use std::io;
 use std::pin::Pin;
 
+#[utoipa::path(
+    get,
+    path = "/dump",
+    tag = "dump",
+    security(("BearerAuth" = [])),
+    params(
+        ("If-None-Match" = Option<String>, Header, description = "Send the previous `ETag` to get 304 when the catalog hasn't changed"),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Newline-delimited JSON (one `Card` object per line)",
+            content_type = "application/x-ndjson",
+            body = String,
+        ),
+        (status = 304, description = "Catalog unchanged since the `If-None-Match` ETag"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn dump(
     State(s): State<AppState>,
     _: ReadAuth,

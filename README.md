@@ -42,6 +42,41 @@ cargo run -p gear5-api
 
 Authentication: `Authorization: Bearer op_live_<...>`.
 
+## API documentation (Swagger UI)
+
+The server hosts an interactive OpenAPI 3.1 explorer:
+
+| URL | Purpose |
+|---|---|
+| `GET /docs/` | Swagger UI shell. Click **Authorize** to paste an `op_live_…` key, then try any route inline. |
+| `GET /api-doc/openapi.json` | Raw spec. Feed it to `openapi-generator`, `swagger-codegen`, Insomnia, Postman, or any tool that consumes OpenAPI. |
+
+The spec is **generated at compile time from the same Rust types and handler signatures the server actually uses** (via `utoipa`), so it cannot drift from the implementation.
+
+Both endpoints are public by default. To require an `admin`-scoped key before either responds, set:
+
+```
+GEAR5_AUTH__PUBLIC_DOCS=false
+```
+
+(or `[auth] public_docs = false` in `config.toml`). With the gate enabled, `/docs/*` and `/api-doc/openapi.json` return 401 without a bearer token and 403 if the token lacks the `admin` scope.
+
+Quick smoke test against a running server:
+
+```bash
+curl -s http://127.0.0.1:8080/api-doc/openapi.json \
+    | jq '{openapi, title: .info.title, paths: (.paths | keys)}'
+```
+
+Typescript client generation (one-liner):
+
+```bash
+npx --yes @openapitools/openapi-generator-cli generate \
+    -i http://127.0.0.1:8080/api-doc/openapi.json \
+    -g typescript-fetch \
+    -o ./gear5-client-ts
+```
+
 ## Configuration
 
 Layered via `figment`:
@@ -62,6 +97,7 @@ See `.env.example`.
 | `auth.cache_capacity` / `GEAR5_AUTH__CACHE_CAPACITY` | 10000 | LRU size of the in-process verify cache (keyed by `sha256(plaintext)`). |
 | `auth.cache_ttl_secs` / `GEAR5_AUTH__CACHE_TTL_SECS` | 30 | How long a successful verify stays cached. Bounds the staleness window for CLI-initiated revocations — see below. |
 | `auth.request_timeout_secs` / `GEAR5_AUTH__REQUEST_TIMEOUT_SECS` | 30 | Tower-HTTP request timeout. Slow clients are dropped with 408. |
+| `auth.public_docs` / `GEAR5_AUTH__PUBLIC_DOCS` | true | When false, `/docs/*` and `/api-doc/openapi.json` require an `admin`-scoped key. |
 | `scrape.concurrency` / `GEAR5_SCRAPE__CONCURRENCY` | 4 | Cap on simultaneous outbound HTTP requests during a scrape (politeness, not throughput). |
 
 ### Auth cache behaviour
@@ -198,6 +234,8 @@ GEAR5_SCRAPE__STALE_AFTER_HOURS=36
 GEAR5_AUTH__CACHE_CAPACITY=10000
 GEAR5_AUTH__CACHE_TTL_SECS=30
 GEAR5_AUTH__REQUEST_TIMEOUT_SECS=30
+# Flip to false to gate /docs and /api-doc/openapi.json behind an admin key
+GEAR5_AUTH__PUBLIC_DOCS=true
 
 RUST_LOG=info,gear5_api=info,gear5_core=info
 EOF
@@ -341,7 +379,7 @@ In the Cloudflare dashboard for `api.example.com`:
 
 - **SSL/TLS → Overview**: set encryption mode to **Full (strict)**. Tunnel terminates HTTPS inside the tunnel, so origin verification is automatic.
 - **Security → WAF**: leave the Cloudflare Managed Ruleset on. Optionally add a custom rule that rate-limits `/admin/*` paths regardless of API key.
-- **Caching → Cache Rules**: cache `GET /images/*` aggressively (the URL is versioned, immutable). Optionally cache `GET /sets` for a few minutes. Do **not** cache anything under `/cards/*` or `/admin/*`.
+- **Caching → Cache Rules**: cache `GET /images/*` aggressively (the URL is versioned, immutable). Optionally cache `GET /sets` for a few minutes. Do **not** cache anything under `/cards/*` or `/admin/*`. Cache `/api-doc/openapi.json` for ~5 min if you want to absorb burst traffic from doc browsers; never cache `/docs/*` (Swagger UI fetches the spec on each load and breaks on stale).
 - **Rules → Page Rules / Configuration Rules**: disable browser integrity check on `/health` so external uptime probes still get a fast 200/503.
 - **Zero Trust → Access (optional)**: gate `/admin/*` behind a Cloudflare Access policy (email OTP, GitHub login, etc.) to add a second factor in front of the admin scope.
 

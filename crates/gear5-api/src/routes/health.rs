@@ -1,4 +1,5 @@
 use crate::middleware::error::ApiError;
+use crate::openapi::schemas::ErrorBody;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -7,12 +8,21 @@ use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use sqlx::Row;
+use utoipa::ToSchema;
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Server is up", body = String),
+    ),
+)]
 pub async fn liveness() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScrapeHealth {
     pub last_run_id: Option<i64>,
     pub last_status: Option<String>,
@@ -24,6 +34,16 @@ pub struct ScrapeHealth {
     pub stale: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/health/scrape",
+    tag = "health",
+    responses(
+        (status = 200, description = "Scrape pipeline healthy", body = ScrapeHealth),
+        (status = 503, description = "Scrape stale (>stale_after_hours) or >=3 consecutive failures", body = ScrapeHealth),
+        (status = 500, body = ErrorBody),
+    ),
+)]
 pub async fn scrape_health(State(s): State<AppState>) -> Result<Response, ApiError> {
     let row = sqlx::query(
         r#"

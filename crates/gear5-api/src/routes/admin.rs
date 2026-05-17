@@ -1,5 +1,6 @@
 use crate::middleware::error::ApiError;
 use crate::middleware::AdminAuth;
+use crate::openapi::schemas::ErrorBody;
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -9,19 +10,23 @@ use gear5_core::auth::{self, NewKeyInput};
 use gear5_core::model::ApiKey;
 use gear5_core::scraper::run_once;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateKeyBody {
     pub name: String,
+    /// Defaults to `["read"]` when omitted. Valid values: `read`, `admin`.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Requests per minute allowed for this key. Defaults to 120 when omitted.
     #[serde(default)]
     pub rate_limit_rpm: Option<i32>,
+    /// Optional RFC3339 expiry timestamp.
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreatedKeyResponse {
     pub id: uuid::Uuid,
     pub name: String,
@@ -34,7 +39,7 @@ pub struct CreatedKeyResponse {
     pub plaintext: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiKeyView {
     pub id: uuid::Uuid,
     pub name: String,
@@ -63,6 +68,19 @@ impl From<ApiKey> for ApiKeyView {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/keys",
+    tag = "admin",
+    security(("BearerAuth" = [])),
+    request_body = CreateKeyBody,
+    responses(
+        (status = 201, description = "Key issued. Plaintext shown ONCE.", body = CreatedKeyResponse),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn create_key(
     State(s): State<AppState>,
     _: AdminAuth,
@@ -98,6 +116,18 @@ pub async fn create_key(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/keys",
+    tag = "admin",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, body = Vec<ApiKeyView>),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn list_keys(
     State(s): State<AppState>,
     _: AdminAuth,
@@ -106,6 +136,22 @@ pub async fn list_keys(
     Ok(Json(rows.into_iter().map(ApiKeyView::from).collect()))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/admin/keys/{id}",
+    tag = "admin",
+    security(("BearerAuth" = [])),
+    params(
+        ("id" = String, Path, description = "UUID or 16-hex lookup prefix of the key to revoke"),
+    ),
+    responses(
+        (status = 200, description = "Revoked; auth cache flushed", body = ApiKeyView),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn revoke_key(
     State(s): State<AppState>,
     _: AdminAuth,
@@ -119,7 +165,7 @@ pub async fn revoke_key(
     Ok(Json(ApiKeyView::from(row)))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScrapeTriggerResponse {
     pub run_id: i64,
     pub status: String,
@@ -130,6 +176,19 @@ pub struct ScrapeTriggerResponse {
     pub cards_updated: i32,
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/scrape/run",
+    tag = "admin",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Scrape completed (possibly partial)", body = ScrapeTriggerResponse),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+        (status = 500, description = "Scrape failed before completion", body = ErrorBody),
+    ),
+)]
 pub async fn trigger_scrape(
     State(s): State<AppState>,
     _: AdminAuth,

@@ -16,6 +16,9 @@ cache_capacity = 10000
 cache_ttl_secs = 30
 # Per-request timeout applied to every route via tower-http TimeoutLayer.
 request_timeout_secs = 30
+# Public Swagger UI + raw spec. Set to false to require an `admin`-scoped key
+# before either `/docs/*` or `/api-doc/openapi.json` will respond.
+public_docs = true
 
 [images]
 dir = "/var/lib/gear5/images"

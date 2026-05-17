@@ -1,5 +1,6 @@
 use crate::middleware::error::ApiError;
 use crate::middleware::ReadAuth;
+use crate::openapi::schemas::ErrorBody;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -8,6 +9,27 @@ use axum::response::Response;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 
+#[utoipa::path(
+    get,
+    path = "/images/{file}",
+    tag = "images",
+    security(("BearerAuth" = [])),
+    params(
+        ("file" = String, Path, description = "Versioned image filename, e.g. `OP01-001.260508.png`"),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Card art (PNG bytes)",
+            content_type = "image/png",
+            body = inline(Vec<u8>),
+        ),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
 pub async fn serve_image(
     State(s): State<AppState>,
     _: ReadAuth,
