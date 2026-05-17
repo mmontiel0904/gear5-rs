@@ -59,16 +59,90 @@ async fn run_inner(
     tracing::info!(sets = sets.len(), "discovered sets");
 
     for set in &sets {
-        match scrape_one_set(pool, http, image_dir, set, report).await {
-            Ok(()) => {
-                report.sets_ok += 1;
+        scrape_set_tracked(pool, http, image_dir, set, report).await;
+    }
+    Ok(())
+}
+
+/// Public entry point for scraping a single dropdown entry. Used by the CLI's `--set` flag and
+/// by future targeted re-scrapes. Creates and closes its own `scrape_runs` row.
+pub async fn run_one(
+    pool: &PgPool,
+    http: &HttpClient,
+    cfg: &ScrapeConfig,
+    image_dir: &Path,
+    source_series: &str,
+) -> Result<ScrapeReport> {
+    let _ = cfg;
+    fs::create_dir_all(image_dir).await?;
+    let run_id = open_run(pool).await?;
+    let mut report = ScrapeReport {
+        run_id,
+        sets_total: 1,
+        ..Default::default()
+    };
+    let set = ParsedSet {
+        source_series: source_series.to_string(),
+        name: source_series.to_string(),
+        display_label: source_series.to_string(),
+    };
+    scrape_set_tracked(pool, http, image_dir, &set, &mut report).await;
+    report.status = if report.sets_ok == 1 {
+        "success".to_string()
+    } else {
+        "failed".to_string()
+    };
+    close_run(pool, &report).await?;
+    Ok(report)
+}
+
+async fn scrape_set_tracked(
+    pool: &PgPool,
+    http: &HttpClient,
+    image_dir: &Path,
+    set: &ParsedSet,
+    report: &mut ScrapeReport,
+) {
+    if let Err(e) = open_run_set(pool, report.run_id, &set.source_series).await {
+        tracing::error!(series = %set.source_series, error = %e, "telemetry open failed");
+    }
+    let before = report.cards_seen;
+    match scrape_one_set(pool, http, image_dir, set, report).await {
+        Ok(primary_set_id) => {
+            report.sets_ok += 1;
+            let cards_this_set = report.cards_seen - before;
+            if let Err(e) = close_run_set(
+                pool,
+                report.run_id,
+                &set.source_series,
+                primary_set_id.as_deref(),
+                cards_this_set,
+                "ok",
+                None,
+            )
+            .await
+            {
+                tracing::warn!(series = %set.source_series, error = %e, "telemetry close failed");
             }
-            Err(e) => {
-                tracing::error!(series = %set.source_series, error = %e, "set scrape failed");
+        }
+        Err(e) => {
+            tracing::error!(series = %set.source_series, error = %e, "set scrape failed");
+            let msg = e.to_string();
+            if let Err(te) = close_run_set(
+                pool,
+                report.run_id,
+                &set.source_series,
+                None,
+                report.cards_seen - before,
+                "failed",
+                Some(&msg),
+            )
+            .await
+            {
+                tracing::warn!(series = %set.source_series, error = %te, "telemetry close failed");
             }
         }
     }
-    Ok(())
 }
 
 async fn scrape_one_set(
@@ -77,12 +151,12 @@ async fn scrape_one_set(
     image_dir: &Path,
     set: &ParsedSet,
     report: &mut ScrapeReport,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let html = http.fetch_series(&set.source_series).await?;
     let cards = parse::parse_cards(&html)?;
     if cards.is_empty() {
         tracing::warn!(series = %set.source_series, "no cards parsed for set");
-        return Ok(());
+        return Ok(None);
     }
     let primary_set_id = parse::set_id_from_code(&cards[0].code)
         .ok_or_else(|| {
@@ -141,7 +215,7 @@ async fn scrape_one_set(
         }
     }
 
-    Ok(())
+    Ok(Some(primary_set_id))
 }
 
 fn image_path(image_dir: &Path, card: &ParsedCard) -> PathBuf {
@@ -332,6 +406,58 @@ async fn close_run(pool: &PgPool, report: &ScrapeReport) -> Result<()> {
     .bind(report.cards_inserted)
     .bind(report.cards_updated)
     .bind(report.error.as_deref())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn open_run_set(pool: &PgPool, run_id: i64, source_series: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO scrape_run_sets (run_id, source_series, status)
+        VALUES ($1, $2, 'running')
+        ON CONFLICT (run_id, source_series) DO UPDATE SET
+            status = EXCLUDED.status,
+            started_at = now(),
+            finished_at = NULL,
+            error = NULL,
+            cards_seen = 0,
+            set_id = NULL
+        "#,
+    )
+    .bind(run_id)
+    .bind(source_series)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn close_run_set(
+    pool: &PgPool,
+    run_id: i64,
+    source_series: &str,
+    set_id: Option<&str>,
+    cards_seen: i32,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE scrape_run_sets
+        SET finished_at = now(),
+            set_id = $3,
+            cards_seen = $4,
+            status = $5,
+            error = $6
+        WHERE run_id = $1 AND source_series = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(source_series)
+    .bind(set_id)
+    .bind(cards_seen)
+    .bind(status)
+    .bind(error)
     .execute(pool)
     .await?;
     Ok(())

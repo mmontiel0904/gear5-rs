@@ -54,16 +54,31 @@ fn parses_op01_alt_art_dual_color() {
 #[test]
 fn parses_op01_sets_dropdown() {
     let sets = parse_sets(OP01_HTML).expect("parse sets");
-    // Anything above ~20 entries means we got the real dropdown, not a fallback.
     assert!(
-        sets.len() >= 20,
-        "expected at least 20 set options, got {}",
+        sets.len() >= 40,
+        "expected the full ~42-entry dropdown, got {}",
         sets.len()
     );
     assert!(
         sets.iter().any(|s| s.source_series == "569101"),
         "OP-01 source_series 569101 must be in dropdown",
     );
+    assert!(
+        sets.iter().any(|s| s.source_series == "569113"),
+        "OP-13 source_series 569113 must be in dropdown",
+    );
+    for s in &sets {
+        let lbl = s.display_label.to_ascii_uppercase();
+        assert!(
+            lbl != "ALL" && lbl != "RECORDING",
+            "ALL/Recording sentinels must not appear as scrapeable sets: {}",
+            s.display_label
+        );
+        assert!(
+            !s.source_series.is_empty(),
+            "source_series must be non-empty"
+        );
+    }
 }
 
 #[test]
