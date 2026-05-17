@@ -295,6 +295,13 @@ pub async fn search_cards(
 /// word in the name (e.g. `Monkey D. Luffy`), not just at the start of the
 /// full string. `$2` is the regex-escaped needle to keep user input from
 /// being interpreted as a regex pattern.
+///
+/// The fuzzy CTE filters on `word_similarity(needle, name_norm) >= 0.3`
+/// rather than the `<%` operator, because `<%` is gated by
+/// `pg_trgm.word_similarity_threshold` (default 0.6 on PG 14+), which
+/// rejects realistic typos like `"lffy"` → `"luffy"` (score ≈ 0.4). The
+/// explicit predicate forfeits the GIN index for this branch but the card
+/// corpus is small and the call sits behind an in-process cache.
 pub(crate) async fn query_suggestions(
     pool: &sqlx::PgPool,
     needle: &str,
@@ -314,7 +321,7 @@ pub(crate) async fn query_suggestions(
         fuzzy AS (
             SELECT code, set_id, name, rarity, color, image_path, image_version, 1::int AS rk
             FROM cards
-            WHERE $1 <% name_norm
+            WHERE word_similarity($1, name_norm) >= 0.3
               AND code NOT IN (SELECT code FROM prefix)
             ORDER BY word_similarity($1, name_norm) DESC
             LIMIT $3
