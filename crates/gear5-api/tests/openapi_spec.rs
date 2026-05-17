@@ -15,6 +15,8 @@ mod middleware;
 mod openapi;
 #[path = "../src/routes/mod.rs"]
 mod routes;
+#[path = "../src/search_cache.rs"]
+mod search_cache;
 #[path = "../src/state.rs"]
 mod state;
 
@@ -48,6 +50,7 @@ fn spec_has_expected_paths_and_security() {
         "/health/scrape",
         "/sets",
         "/cards",
+        "/cards/search",
         "/cards/{code}",
         "/dump",
         "/images/{file}",
@@ -91,6 +94,7 @@ fn spec_components_include_core_schemas() {
         "CardSet",
         "CardView",
         "CardListResponse",
+        "CardSuggestion",
         "ScrapeHealth",
         "CreateKeyBody",
         "CreatedKeyResponse",

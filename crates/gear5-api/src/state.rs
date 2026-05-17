@@ -1,4 +1,6 @@
 use crate::auth_cache::AuthCache;
+use crate::routes::cards::CardSuggestion;
+use crate::search_cache::SearchCache;
 use gear5_core::config::Config;
 use gear5_core::scraper::HttpClient;
 use governor::clock::DefaultClock;
@@ -13,6 +15,8 @@ use uuid::Uuid;
 
 pub type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+pub type CardSuggestionCache = SearchCache<Vec<CardSuggestion>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -21,6 +25,7 @@ pub struct AppState {
     pub limiters: Arc<RwLock<HashMap<Uuid, Arc<DirectLimiter>>>>,
     pub scrape_lock: Arc<tokio::sync::Mutex<()>>,
     pub auth_cache: Arc<AuthCache>,
+    pub search_cache: Arc<CardSuggestionCache>,
 }
 
 impl AppState {

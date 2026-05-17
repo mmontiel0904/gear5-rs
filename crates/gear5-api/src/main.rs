@@ -3,6 +3,7 @@ mod middleware;
 mod openapi;
 mod routes;
 mod scheduler;
+mod search_cache;
 mod state;
 
 use anyhow::Context;
@@ -28,7 +29,11 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth_cache::AuthCache;
 use crate::middleware::AdminAuth;
 use crate::openapi::ApiDoc;
+use crate::search_cache::SearchCache;
 use crate::state::AppState;
+
+const SEARCH_CACHE_CAPACITY: usize = 1024;
+const SEARCH_CACHE_TTL_SECS: u64 = 60;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,6 +59,11 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cfg.auth.cache_ttl_secs.max(1)),
     ));
 
+    let search_cache = Arc::new(SearchCache::new(
+        NonZeroUsize::new(SEARCH_CACHE_CAPACITY).expect("SEARCH_CACHE_CAPACITY is non-zero"),
+        Duration::from_secs(SEARCH_CACHE_TTL_SECS),
+    ));
+
     let state = AppState {
         pool: pool.clone(),
         cfg: cfg.clone(),
@@ -61,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         limiters: Arc::new(RwLock::new(HashMap::new())),
         scrape_lock: Arc::new(tokio::sync::Mutex::new(())),
         auth_cache,
+        search_cache,
     };
 
     if cfg.scrape.enabled {
@@ -89,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/scrape", get(routes::health::scrape_health))
         .route("/sets", get(routes::sets::list_sets))
         .route("/cards", get(routes::cards::list_cards))
+        .route("/cards/search", get(routes::cards::search_cards))
         .route("/cards/:code", get(routes::cards::get_card))
         .route("/dump", get(routes::dump::dump))
         .route("/images/:file", get(routes::images::serve_image))

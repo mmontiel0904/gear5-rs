@@ -3,10 +3,13 @@ use crate::middleware::ReadAuth;
 use crate::openapi::schemas::ErrorBody;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::Json;
 use gear5_core::model::Card;
 use serde::{Deserialize, Serialize};
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{FromRow, Postgres, QueryBuilder};
+use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -50,12 +53,12 @@ pub struct CardListResponse {
     pub limit: i64,
 }
 
-fn image_url(card: &Card) -> String {
-    let stem = card.image_path.trim_end_matches(".png");
-    if card.image_version.is_empty() {
+fn image_url(image_path: &str, image_version: &str) -> String {
+    let stem = image_path.trim_end_matches(".png");
+    if image_version.is_empty() {
         format!("/images/{}.png", stem)
     } else {
-        format!("/images/{}.{}.png", stem, card.image_version)
+        format!("/images/{}.{}.png", stem, image_version)
     }
 }
 
@@ -93,7 +96,7 @@ pub async fn get_card(
     .fetch_optional(&s.pool)
     .await?;
     let card = card.ok_or_else(ApiError::not_found)?;
-    let url = image_url(&card);
+    let url = image_url(&card.image_path, &card.image_version);
     Ok(Json(CardView {
         card,
         image_url: url,
@@ -182,7 +185,7 @@ pub async fn list_cards(
     let items = rows
         .into_iter()
         .map(|c| {
-            let url = image_url(&c);
+            let url = image_url(&c.image_path, &c.image_version);
             CardView {
                 card: c,
                 image_url: url,
@@ -195,4 +198,130 @@ pub async fn list_cards(
         next_cursor,
         limit,
     }))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SearchParams {
+    /// Free-text query, matched against card name (prefix first, trigram fuzzy fallback).
+    /// Queries shorter than 2 characters return an empty list.
+    pub q: String,
+    /// Result cap. Clamped to `[1, 25]`. Defaults to 10.
+    #[param(minimum = 1, maximum = 25)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CardSuggestion {
+    pub code: String,
+    pub set_id: String,
+    pub name: String,
+    pub rarity: String,
+    pub color: String,
+    /// Server-relative URL for the cached card art.
+    pub image_url: String,
+}
+
+#[derive(FromRow)]
+struct CardSuggestionRow {
+    code: String,
+    set_id: String,
+    name: String,
+    rarity: String,
+    color: String,
+    image_path: String,
+    image_version: String,
+}
+
+impl From<CardSuggestionRow> for CardSuggestion {
+    fn from(r: CardSuggestionRow) -> Self {
+        let image_url = image_url(&r.image_path, &r.image_version);
+        Self {
+            code: r.code,
+            set_id: r.set_id,
+            name: r.name,
+            rarity: r.rarity,
+            color: r.color,
+            image_url,
+        }
+    }
+}
+
+const SEARCH_DEFAULT_LIMIT: i64 = 10;
+const SEARCH_MAX_LIMIT: i64 = 25;
+const SEARCH_MIN_CHARS: usize = 2;
+
+#[utoipa::path(
+    get,
+    path = "/cards/search",
+    tag = "catalog",
+    security(("BearerAuth" = [])),
+    params(SearchParams),
+    responses(
+        (status = 200, body = Vec<CardSuggestion>),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 429, body = ErrorBody),
+    ),
+)]
+pub async fn search_cards(
+    State(s): State<AppState>,
+    _: ReadAuth,
+    Query(p): Query<SearchParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let limit = p.limit.unwrap_or(SEARCH_DEFAULT_LIMIT).clamp(1, SEARCH_MAX_LIMIT);
+
+    let needle = p.q.trim().to_lowercase();
+    if needle.chars().count() < SEARCH_MIN_CHARS {
+        return Ok(suggestion_response(Arc::new(Vec::new())));
+    }
+
+    if let Some(cached) = s.search_cache.get(&needle, limit) {
+        return Ok(suggestion_response(cached));
+    }
+
+    let rows: Vec<CardSuggestionRow> = sqlx::query_as(
+        r#"
+        WITH prefix AS (
+            SELECT code, set_id, name, rarity, color, image_path, image_version, 0::int AS rk
+            FROM cards
+            WHERE name_norm LIKE $1 || '%'
+            ORDER BY name_norm
+            LIMIT $2
+        ),
+        fuzzy AS (
+            SELECT code, set_id, name, rarity, color, image_path, image_version, 1::int AS rk
+            FROM cards
+            WHERE name_norm % $1
+              AND code NOT IN (SELECT code FROM prefix)
+            ORDER BY similarity(name_norm, $1) DESC
+            LIMIT $2
+        )
+        SELECT code, set_id, name, rarity, color, image_path, image_version
+        FROM (
+            SELECT * FROM prefix
+            UNION ALL
+            SELECT * FROM fuzzy
+        ) merged
+        ORDER BY rk, name
+        LIMIT $2
+        "#,
+    )
+    .bind(&needle)
+    .bind(limit)
+    .fetch_all(&s.pool)
+    .await?;
+
+    let suggestions: Arc<Vec<CardSuggestion>> =
+        Arc::new(rows.into_iter().map(CardSuggestion::from).collect());
+    s.search_cache.insert(&needle, limit, suggestions.clone());
+
+    Ok(suggestion_response(suggestions))
+}
+
+fn suggestion_response(suggestions: Arc<Vec<CardSuggestion>>) -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "public, max-age=30")],
+        Json((*suggestions).clone()),
+    )
 }
