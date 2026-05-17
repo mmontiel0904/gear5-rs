@@ -286,30 +286,38 @@ pub async fn search_cards(
     Ok(suggestion_response(suggestions))
 }
 
-/// SQL-only path for `/cards/search`: prefix match first, trigram-similarity
-/// fallback for typos. Caller is responsible for normalizing `needle`
-/// (lowercase; the `cards.name_norm` generated column already strips accents).
+/// SQL-only path for `/cards/search`: word-boundary prefix match first,
+/// trigram word-similarity fallback for typos. Caller is responsible for
+/// normalizing `needle` (lowercase; the `cards.name_norm` generated column
+/// already strips accents).
+///
+/// The prefix CTE uses `~ '\y' || $2` so `"lu"` matches at the start of any
+/// word in the name (e.g. `Monkey D. Luffy`), not just at the start of the
+/// full string. `$2` is the regex-escaped needle to keep user input from
+/// being interpreted as a regex pattern.
 pub(crate) async fn query_suggestions(
     pool: &sqlx::PgPool,
     needle: &str,
     limit: i64,
 ) -> Result<Vec<CardSuggestion>, sqlx::Error> {
+    let escaped = regex_escape(needle);
+
     let rows: Vec<CardSuggestionRow> = sqlx::query_as(
         r#"
         WITH prefix AS (
             SELECT code, set_id, name, rarity, color, image_path, image_version, 0::int AS rk
             FROM cards
-            WHERE name_norm LIKE $1 || '%'
+            WHERE name_norm ~ ('\y' || $2)
             ORDER BY name_norm
-            LIMIT $2
+            LIMIT $3
         ),
         fuzzy AS (
             SELECT code, set_id, name, rarity, color, image_path, image_version, 1::int AS rk
             FROM cards
-            WHERE name_norm % $1
+            WHERE $1 <% name_norm
               AND code NOT IN (SELECT code FROM prefix)
-            ORDER BY similarity(name_norm, $1) DESC
-            LIMIT $2
+            ORDER BY word_similarity($1, name_norm) DESC
+            LIMIT $3
         )
         SELECT code, set_id, name, rarity, color, image_path, image_version
         FROM (
@@ -318,15 +326,30 @@ pub(crate) async fn query_suggestions(
             SELECT * FROM fuzzy
         ) merged
         ORDER BY rk, name
-        LIMIT $2
+        LIMIT $3
         "#,
     )
     .bind(needle)
+    .bind(&escaped)
     .bind(limit)
     .fetch_all(pool)
     .await?;
 
     Ok(rows.into_iter().map(CardSuggestion::from).collect())
+}
+
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn suggestion_response(suggestions: Arc<Vec<CardSuggestion>>) -> impl IntoResponse {
