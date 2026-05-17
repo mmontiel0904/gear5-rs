@@ -280,6 +280,20 @@ pub async fn search_cards(
         return Ok(suggestion_response(cached));
     }
 
+    let suggestions = Arc::new(query_suggestions(&s.pool, &needle, limit).await?);
+    s.search_cache.insert(&needle, limit, suggestions.clone());
+
+    Ok(suggestion_response(suggestions))
+}
+
+/// SQL-only path for `/cards/search`: prefix match first, trigram-similarity
+/// fallback for typos. Caller is responsible for normalizing `needle`
+/// (lowercase; the `cards.name_norm` generated column already strips accents).
+pub(crate) async fn query_suggestions(
+    pool: &sqlx::PgPool,
+    needle: &str,
+    limit: i64,
+) -> Result<Vec<CardSuggestion>, sqlx::Error> {
     let rows: Vec<CardSuggestionRow> = sqlx::query_as(
         r#"
         WITH prefix AS (
@@ -307,16 +321,12 @@ pub async fn search_cards(
         LIMIT $2
         "#,
     )
-    .bind(&needle)
+    .bind(needle)
     .bind(limit)
-    .fetch_all(&s.pool)
+    .fetch_all(pool)
     .await?;
 
-    let suggestions: Arc<Vec<CardSuggestion>> =
-        Arc::new(rows.into_iter().map(CardSuggestion::from).collect());
-    s.search_cache.insert(&needle, limit, suggestions.clone());
-
-    Ok(suggestion_response(suggestions))
+    Ok(rows.into_iter().map(CardSuggestion::from).collect())
 }
 
 fn suggestion_response(suggestions: Arc<Vec<CardSuggestion>>) -> impl IntoResponse {
