@@ -1,0 +1,9 @@
+[server]
+bind = "0.0.0.0:8080"
+
+[database]
+url = "postgres://gear5:gear5@localhost:5432/gear5"
+
+[images]
+# This overrides the default /var/lib/gear5/images path
+dir = "./var/images"
