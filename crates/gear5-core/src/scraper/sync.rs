@@ -522,13 +522,15 @@ async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet) -> Result<()> {
 }
 
 /// Ensure a set row exists for a secondary set referenced by cards on a cross-set page.
-/// Uses DO NOTHING so that it never overwrites the canonical source_series of an existing set.
+/// Uses DO NOTHING (no conflict target) to suppress ALL unique violations — both on `id` (set
+/// already exists) and on `source_series` (another secondary set from the same cross-set page
+/// was already inserted with the same placeholder source_series value).
 async fn ensure_set_fk(pool: &PgPool, id: &str, placeholder_source_series: &str) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO sets (id, source_series, name, display_label)
         VALUES ($1,$2,$3,$3)
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT DO NOTHING
         "#,
     )
     .bind(id)
