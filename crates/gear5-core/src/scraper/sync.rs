@@ -177,7 +177,7 @@ async fn scrape_set_tracked(
     let before_seen = report.cards_seen;
     let before_unchanged = report.cards_unchanged;
     match scrape_one_set(pool, http, image_dir, set, report).await {
-        Ok(primary_set_id) => {
+        Ok((primary_set_id, html_hash)) => {
             report.sets_ok += 1;
             let cards_this_set = report.cards_seen - before_seen;
             let unchanged_this_set = report.cards_unchanged - before_unchanged;
@@ -188,6 +188,7 @@ async fn scrape_set_tracked(
                 primary_set_id.as_deref(),
                 cards_this_set,
                 unchanged_this_set,
+                html_hash.as_deref(),
                 "ok",
                 None,
             )
@@ -208,6 +209,7 @@ async fn scrape_set_tracked(
                 None,
                 cards_this_set,
                 unchanged_this_set,
+                None,
                 "failed",
                 Some(&msg),
             )
@@ -225,7 +227,7 @@ async fn scrape_one_set(
     image_dir: &Path,
     set: &ParsedSet,
     report: &mut ScrapeReport,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, Option<Vec<u8>>)> {
     let html = http.fetch_series(&set.source_series).await?;
 
     // Compute SHA-256 of the raw HTML to detect unchanged pages.
@@ -235,9 +237,20 @@ async fn scrape_one_set(
         h.finalize().to_vec()
     };
 
-    // Look up the stored html_hash for this source_series.
+    // Look up the html_hash stored on the last successful scrape_run_sets row for this
+    // source_series. Keying on source_series (not set id) is correct because the hash tracks
+    // whether the *page* changed, and a single page can contain cards from many sets.
     let stored_hash: Option<Vec<u8>> = sqlx::query_as(
-        "SELECT html_hash FROM sets WHERE source_series = $1",
+        r#"
+        SELECT srs.html_hash
+        FROM scrape_run_sets srs
+        JOIN scrape_runs sr ON sr.id = srs.run_id
+        WHERE srs.source_series = $1
+          AND srs.status = 'ok'
+          AND srs.html_hash IS NOT NULL
+        ORDER BY sr.id DESC
+        LIMIT 1
+        "#,
     )
     .bind(&set.source_series)
     .fetch_optional(pool)
@@ -281,13 +294,14 @@ async fn scrape_one_set(
             cards_skipped = last_seen,
             "set HTML unchanged, skipping card upserts"
         );
-        return Ok(primary_set_id);
+        // Propagate the hash so close_run_set can persist it and future runs can skip again.
+        return Ok((primary_set_id, Some(new_hash)));
     }
 
     let cards = parse::parse_cards(&html)?;
     if cards.is_empty() {
         tracing::warn!(series = %set.source_series, "no cards parsed for set");
-        return Ok(None);
+        return Ok((None, None));
     }
     let primary_set_id = parse::set_id_from_code(&cards[0].code)
         .ok_or_else(|| {
@@ -300,16 +314,21 @@ async fn scrape_one_set(
     tracing::info!(set = %primary_set_id, count = cards.len(), "parsed set");
     report.cards_seen += cards.len() as i32;
 
-    // Upsert every distinct set id referenced by the cards on this page so card FKs always resolve.
+    // Upsert the primary set (writes source_series on INSERT, never overwrites it).
+    upsert_set(pool, &primary_set_id, set).await?;
+
+    // For every other set id referenced by cards on this page (cross-set pages like Promotion
+    // cards list cards from many different sets), just ensure the FK row exists without touching
+    // the canonical source_series of those sets.
     let mut seen_set_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    seen_set_ids.insert(primary_set_id.clone());
     for c in &cards {
         if let Some(sid) = parse::set_id_from_code(&c.code) {
             seen_set_ids.insert(sid.to_string());
         }
     }
+    seen_set_ids.remove(&primary_set_id);
     for sid in &seen_set_ids {
-        upsert_set(pool, sid, set, Some(&new_hash)).await?;
+        ensure_set_fk(pool, sid, &set.source_series).await?;
     }
 
     for card in &cards {
@@ -346,7 +365,7 @@ async fn scrape_one_set(
         }
     }
 
-    Ok(Some(primary_set_id))
+    Ok((Some(primary_set_id), Some(new_hash)))
 }
 
 fn image_path(image_dir: &Path, card: &ParsedCard) -> PathBuf {
@@ -479,16 +498,17 @@ async fn upsert_card(
     })
 }
 
-async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet, html_hash: Option<&[u8]>) -> Result<()> {
+/// Upsert the **primary** set for a source_series page.
+/// `source_series` is written only on INSERT and never overwritten — this prevents cross-set
+/// pages (e.g. Promotion cards) from clobbering the canonical source_series of existing sets.
+async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO sets (id, source_series, name, display_label, html_hash)
-        VALUES ($1,$2,$3,$4,$5)
+        INSERT INTO sets (id, source_series, name, display_label)
+        VALUES ($1,$2,$3,$4)
         ON CONFLICT (id) DO UPDATE SET
-            source_series = EXCLUDED.source_series,
             name          = EXCLUDED.name,
             display_label = EXCLUDED.display_label,
-            html_hash     = EXCLUDED.html_hash,
             updated_at    = now()
         "#,
     )
@@ -496,7 +516,24 @@ async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet, html_hash: Option<
     .bind(&set.source_series)
     .bind(&set.name)
     .bind(&set.display_label)
-    .bind(html_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Ensure a set row exists for a secondary set referenced by cards on a cross-set page.
+/// Uses DO NOTHING so that it never overwrites the canonical source_series of an existing set.
+async fn ensure_set_fk(pool: &PgPool, id: &str, placeholder_source_series: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sets (id, source_series, name, display_label)
+        VALUES ($1,$2,$3,$3)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(id)
+    .bind(placeholder_source_series)
+    .bind(id)
     .execute(pool)
     .await?;
     Ok(())
@@ -556,6 +593,7 @@ async fn open_run_set(pool: &PgPool, run_id: i64, source_series: &str) -> Result
             started_at      = now(),
             finished_at     = NULL,
             error           = NULL,
+            html_hash       = NULL,
             cards_seen      = 0,
             cards_unchanged = 0,
             set_id          = NULL
@@ -576,6 +614,7 @@ async fn close_run_set(
     set_id: Option<&str>,
     cards_seen: i32,
     cards_unchanged: i32,
+    html_hash: Option<&[u8]>,
     status: &str,
     error: Option<&str>,
 ) -> Result<()> {
@@ -586,8 +625,9 @@ async fn close_run_set(
             set_id          = $3,
             cards_seen      = $4,
             cards_unchanged = $5,
-            status          = $6,
-            error           = $7
+            html_hash       = $6,
+            status          = $7,
+            error           = $8
         WHERE run_id = $1 AND source_series = $2
         "#,
     )
@@ -596,6 +636,7 @@ async fn close_run_set(
     .bind(set_id)
     .bind(cards_seen)
     .bind(cards_unchanged)
+    .bind(html_hash)
     .bind(status)
     .bind(error)
     .execute(pool)
