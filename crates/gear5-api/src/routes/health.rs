@@ -32,6 +32,11 @@ pub struct ScrapeHealth {
     pub last_error: Option<String>,
     pub consecutive_failures: i64,
     pub stale: bool,
+    /// True when the most recent run row has status = 'running' (i.e. a scrape is active right now).
+    pub is_running: bool,
+    /// How many seconds the current in-progress run has been active.
+    /// None when no run is currently running.
+    pub running_age_secs: Option<i64>,
 }
 
 #[utoipa::path(
@@ -101,11 +106,23 @@ pub async fn scrape_health(State(s): State<AppState>) -> Result<Response, ApiErr
         last_error: None,
         consecutive_failures,
         stale: false,
+        is_running: false,
+        running_age_secs: None,
     };
+
     if let Some(r) = row {
+        let status: String = r.try_get("status")?;
+        let started_at: DateTime<Utc> = r.try_get("started_at")?;
+
+        if status == "running" {
+            health.is_running = true;
+            health.running_age_secs =
+                Some(Utc::now().signed_duration_since(started_at).num_seconds());
+        }
+
         health.last_run_id = Some(r.try_get("id")?);
-        health.last_status = Some(r.try_get("status")?);
-        health.last_started_at = Some(r.try_get("started_at")?);
+        health.last_status = Some(status);
+        health.last_started_at = Some(started_at);
         health.last_finished_at = r.try_get("finished_at")?;
         health.last_error = r.try_get("error")?;
     }

@@ -54,6 +54,7 @@ pub struct ScrapeRun {
     pub cards_seen: Option<i32>,
     pub cards_inserted: Option<i32>,
     pub cards_updated: Option<i32>,
+    pub cards_unchanged: i32,
     pub error: Option<String>,
 }
 
@@ -116,6 +117,7 @@ pub struct ScrapeReport {
     pub cards_seen: i32,
     pub cards_inserted: i32,
     pub cards_updated: i32,
+    pub cards_unchanged: i32,
     pub status: String,
     pub error: Option<String>,
 }

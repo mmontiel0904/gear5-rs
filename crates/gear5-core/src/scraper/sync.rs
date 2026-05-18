@@ -10,6 +10,46 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+/// On startup, mark any scrape_runs / scrape_run_sets rows that were left in the 'running' state
+/// (e.g. because the process was killed mid-scrape) as 'failed'. Without this, health checks and
+/// history queries would permanently show stale ghost runs.
+pub async fn cleanup_stale_runs(pool: &PgPool) -> Result<()> {
+    let run_rows = sqlx::query(
+        r#"
+        UPDATE scrape_runs
+        SET status      = 'failed',
+            finished_at = COALESCE(finished_at, now()),
+            error       = 'process terminated unexpectedly'
+        WHERE status = 'running'
+        RETURNING id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let set_rows = sqlx::query(
+        r#"
+        UPDATE scrape_run_sets
+        SET status      = 'failed',
+            finished_at = COALESCE(finished_at, now()),
+            error       = 'process terminated unexpectedly'
+        WHERE status = 'running'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    if !run_rows.is_empty() {
+        tracing::warn!(
+            runs = run_rows.len(),
+            sets = set_rows.rows_affected(),
+            "cleaned up stale scrape_runs left by a previous crash"
+        );
+    }
+
+    Ok(())
+}
+
 /// Top-level scrape entry point. Single-flight; callers are expected to serialise.
 pub async fn run_once(
     pool: &PgPool,
@@ -34,12 +74,40 @@ pub async fn run_once(
             } else {
                 "failed".to_string()
             };
-            close_run(pool, &report).await?;
+            if let Err(e) = close_run(pool, &report).await {
+                tracing::error!(
+                    error = %e,
+                    run_id = report.run_id,
+                    status = %report.status,
+                    sets_total = report.sets_total,
+                    sets_ok = report.sets_ok,
+                    cards_seen = report.cards_seen,
+                    cards_inserted = report.cards_inserted,
+                    cards_updated = report.cards_updated,
+                    cards_unchanged = report.cards_unchanged,
+                    "failed to persist close_run — run data lost to DB but captured here"
+                );
+                return Err(e);
+            }
         }
         Err(e) => {
             report.status = "failed".to_string();
             report.error = Some(e.to_string());
-            close_run(pool, &report).await?;
+            if let Err(ce) = close_run(pool, &report).await {
+                tracing::error!(
+                    close_error = %ce,
+                    scrape_error = %e,
+                    run_id = report.run_id,
+                    sets_total = report.sets_total,
+                    sets_ok = report.sets_ok,
+                    cards_seen = report.cards_seen,
+                    cards_inserted = report.cards_inserted,
+                    cards_updated = report.cards_updated,
+                    cards_unchanged = report.cards_unchanged,
+                    "failed to persist close_run after scrape error — run data lost to DB but captured here"
+                );
+                return Err(ce);
+            }
             return Err(e);
         }
     }
@@ -106,17 +174,20 @@ async fn scrape_set_tracked(
     if let Err(e) = open_run_set(pool, report.run_id, &set.source_series).await {
         tracing::error!(series = %set.source_series, error = %e, "telemetry open failed");
     }
-    let before = report.cards_seen;
+    let before_seen = report.cards_seen;
+    let before_unchanged = report.cards_unchanged;
     match scrape_one_set(pool, http, image_dir, set, report).await {
         Ok(primary_set_id) => {
             report.sets_ok += 1;
-            let cards_this_set = report.cards_seen - before;
+            let cards_this_set = report.cards_seen - before_seen;
+            let unchanged_this_set = report.cards_unchanged - before_unchanged;
             if let Err(e) = close_run_set(
                 pool,
                 report.run_id,
                 &set.source_series,
                 primary_set_id.as_deref(),
                 cards_this_set,
+                unchanged_this_set,
                 "ok",
                 None,
             )
@@ -128,12 +199,15 @@ async fn scrape_set_tracked(
         Err(e) => {
             tracing::error!(series = %set.source_series, error = %e, "set scrape failed");
             let msg = e.to_string();
+            let cards_this_set = report.cards_seen - before_seen;
+            let unchanged_this_set = report.cards_unchanged - before_unchanged;
             if let Err(te) = close_run_set(
                 pool,
                 report.run_id,
                 &set.source_series,
                 None,
-                report.cards_seen - before,
+                cards_this_set,
+                unchanged_this_set,
                 "failed",
                 Some(&msg),
             )
@@ -153,6 +227,63 @@ async fn scrape_one_set(
     report: &mut ScrapeReport,
 ) -> Result<Option<String>> {
     let html = http.fetch_series(&set.source_series).await?;
+
+    // Compute SHA-256 of the raw HTML to detect unchanged pages.
+    let new_hash: Vec<u8> = {
+        let mut h = Sha256::new();
+        h.update(html.as_bytes());
+        h.finalize().to_vec()
+    };
+
+    // Look up the stored html_hash for this source_series.
+    let stored_hash: Option<Vec<u8>> = sqlx::query_as(
+        "SELECT html_hash FROM sets WHERE source_series = $1",
+    )
+    .bind(&set.source_series)
+    .fetch_optional(pool)
+    .await?
+    .and_then(|(h,): (Option<Vec<u8>>,)| h);
+
+    if stored_hash.as_deref() == Some(new_hash.as_slice()) {
+        // Page is unchanged — skip all card upserts. Count the cards from the last run so the
+        // parent report still reflects reality.
+        let last_seen: i32 = sqlx::query_as(
+            r#"
+            SELECT COALESCE(srs.cards_seen, 0)
+            FROM scrape_run_sets srs
+            JOIN scrape_runs sr ON sr.id = srs.run_id
+            WHERE srs.source_series = $1
+              AND srs.status = 'ok'
+            ORDER BY sr.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&set.source_series)
+        .fetch_optional(pool)
+        .await?
+        .map(|(n,): (i32,)| n)
+        .unwrap_or(0);
+
+        report.cards_seen += last_seen;
+        report.cards_unchanged += last_seen;
+
+        // Derive primary set id for telemetry from the sets table.
+        let primary_set_id: Option<String> = sqlx::query_as(
+            "SELECT id FROM sets WHERE source_series = $1 LIMIT 1",
+        )
+        .bind(&set.source_series)
+        .fetch_optional(pool)
+        .await?
+        .map(|(id,): (String,)| id);
+
+        tracing::debug!(
+            series = %set.source_series,
+            cards_skipped = last_seen,
+            "set HTML unchanged, skipping card upserts"
+        );
+        return Ok(primary_set_id);
+    }
+
     let cards = parse::parse_cards(&html)?;
     if cards.is_empty() {
         tracing::warn!(series = %set.source_series, "no cards parsed for set");
@@ -178,7 +309,7 @@ async fn scrape_one_set(
         }
     }
     for sid in &seen_set_ids {
-        upsert_set(pool, sid, set).await?;
+        upsert_set(pool, sid, set, Some(&new_hash)).await?;
     }
 
     for card in &cards {
@@ -188,7 +319,7 @@ async fn scrape_one_set(
         match outcome {
             UpsertOutcome::Inserted => report.cards_inserted += 1,
             UpsertOutcome::Updated => report.cards_updated += 1,
-            UpsertOutcome::Unchanged => {}
+            UpsertOutcome::Unchanged => report.cards_unchanged += 1,
         }
 
         let local_image = image_path(image_dir, card);
@@ -348,15 +479,16 @@ async fn upsert_card(
     })
 }
 
-async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet) -> Result<()> {
+async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet, html_hash: Option<&[u8]>) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO sets (id, source_series, name, display_label)
-        VALUES ($1,$2,$3,$4)
+        INSERT INTO sets (id, source_series, name, display_label, html_hash)
+        VALUES ($1,$2,$3,$4,$5)
         ON CONFLICT (id) DO UPDATE SET
             source_series = EXCLUDED.source_series,
             name          = EXCLUDED.name,
             display_label = EXCLUDED.display_label,
+            html_hash     = EXCLUDED.html_hash,
             updated_at    = now()
         "#,
     )
@@ -364,6 +496,7 @@ async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet) -> Result<()> {
     .bind(&set.source_series)
     .bind(&set.name)
     .bind(&set.display_label)
+    .bind(html_hash)
     .execute(pool)
     .await?;
     Ok(())
@@ -387,14 +520,15 @@ async fn close_run(pool: &PgPool, report: &ScrapeReport) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE scrape_runs
-        SET finished_at = now(),
-            status = $2,
-            sets_total = $3,
-            sets_ok = $4,
-            cards_seen = $5,
-            cards_inserted = $6,
-            cards_updated = $7,
-            error = $8
+        SET finished_at     = now(),
+            status          = $2,
+            sets_total      = $3,
+            sets_ok         = $4,
+            cards_seen      = $5,
+            cards_inserted  = $6,
+            cards_updated   = $7,
+            cards_unchanged = $8,
+            error           = $9
         WHERE id = $1
         "#,
     )
@@ -405,6 +539,7 @@ async fn close_run(pool: &PgPool, report: &ScrapeReport) -> Result<()> {
     .bind(report.cards_seen)
     .bind(report.cards_inserted)
     .bind(report.cards_updated)
+    .bind(report.cards_unchanged)
     .bind(report.error.as_deref())
     .execute(pool)
     .await?;
@@ -417,12 +552,13 @@ async fn open_run_set(pool: &PgPool, run_id: i64, source_series: &str) -> Result
         INSERT INTO scrape_run_sets (run_id, source_series, status)
         VALUES ($1, $2, 'running')
         ON CONFLICT (run_id, source_series) DO UPDATE SET
-            status = EXCLUDED.status,
-            started_at = now(),
-            finished_at = NULL,
-            error = NULL,
-            cards_seen = 0,
-            set_id = NULL
+            status          = EXCLUDED.status,
+            started_at      = now(),
+            finished_at     = NULL,
+            error           = NULL,
+            cards_seen      = 0,
+            cards_unchanged = 0,
+            set_id          = NULL
         "#,
     )
     .bind(run_id)
@@ -432,23 +568,26 @@ async fn open_run_set(pool: &PgPool, run_id: i64, source_series: &str) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn close_run_set(
     pool: &PgPool,
     run_id: i64,
     source_series: &str,
     set_id: Option<&str>,
     cards_seen: i32,
+    cards_unchanged: i32,
     status: &str,
     error: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE scrape_run_sets
-        SET finished_at = now(),
-            set_id = $3,
-            cards_seen = $4,
-            status = $5,
-            error = $6
+        SET finished_at     = now(),
+            set_id          = $3,
+            cards_seen      = $4,
+            cards_unchanged = $5,
+            status          = $6,
+            error           = $7
         WHERE run_id = $1 AND source_series = $2
         "#,
     )
@@ -456,6 +595,7 @@ async fn close_run_set(
     .bind(source_series)
     .bind(set_id)
     .bind(cards_seen)
+    .bind(cards_unchanged)
     .bind(status)
     .bind(error)
     .execute(pool)

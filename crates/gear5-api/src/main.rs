@@ -12,7 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use gear5_core::config::Config;
 use gear5_core::db;
-use gear5_core::scraper::HttpClient;
+use gear5_core::scraper::{cleanup_stale_runs, HttpClient};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -49,6 +49,9 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::connect(&cfg.database).await.context("db connect")?;
     db::migrate(&pool).await.context("migrate")?;
+    cleanup_stale_runs(&pool)
+        .await
+        .context("cleanup stale runs")?;
 
     let http = HttpClient::new(&cfg.scrape).context("http client")?;
 
@@ -110,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/keys/:id", delete(routes::admin::revoke_key))
         .route("/admin/scrape/run", post(routes::admin::trigger_scrape))
+        .route("/admin/scrape/runs", get(routes::admin::list_runs))
+        .route("/admin/scrape/runs/active", get(routes::admin::active_run))
         .merge(docs_router)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
