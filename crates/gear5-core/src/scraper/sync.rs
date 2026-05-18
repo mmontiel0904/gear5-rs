@@ -328,7 +328,7 @@ async fn scrape_one_set(
     }
     seen_set_ids.remove(&primary_set_id);
     for sid in &seen_set_ids {
-        ensure_set_fk(pool, sid, &set.source_series).await?;
+        ensure_set_fk(pool, sid).await?;
     }
 
     for card in &cards {
@@ -499,14 +499,22 @@ async fn upsert_card(
 }
 
 /// Upsert the **primary** set for a source_series page.
-/// `source_series` is written only on INSERT and never overwritten — this prevents cross-set
-/// pages (e.g. Promotion cards) from clobbering the canonical source_series of existing sets.
+///
+/// On INSERT, writes the real source_series from the scraped index.
+/// On UPDATE (set already exists), promotes source_series only if it currently holds the
+/// self-referential placeholder written by `ensure_set_fk` (i.e. source_series = id).
+/// This means a set whose FK row was pre-created by a cross-set page will get its real
+/// source_series filled in the first time its own page is scraped.
 async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO sets (id, source_series, name, display_label)
         VALUES ($1,$2,$3,$4)
         ON CONFLICT (id) DO UPDATE SET
+            source_series = CASE
+                                WHEN sets.source_series = sets.id THEN EXCLUDED.source_series
+                                ELSE sets.source_series
+                            END,
             name          = EXCLUDED.name,
             display_label = EXCLUDED.display_label,
             updated_at    = now()
@@ -521,20 +529,21 @@ async fn upsert_set(pool: &PgPool, id: &str, set: &ParsedSet) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a set row exists for a secondary set referenced by cards on a cross-set page.
-/// Uses DO NOTHING (no conflict target) to suppress ALL unique violations — both on `id` (set
-/// already exists) and on `source_series` (another secondary set from the same cross-set page
-/// was already inserted with the same placeholder source_series value).
-async fn ensure_set_fk(pool: &PgPool, id: &str, placeholder_source_series: &str) -> Result<()> {
+/// Ensure a FK-satisfying set row exists for a secondary set referenced by cards on a
+/// cross-set page (e.g. Promotion cards page lists cards from EB01, OP01, …).
+///
+/// Uses the set's own `id` as the `source_series` placeholder. Set ids are alphanumeric
+/// (e.g. "EB01"), while real source_series values are numeric strings (e.g. "569302"),
+/// so there is no collision risk. `ON CONFLICT (id) DO NOTHING` means existing sets
+/// (already scraped from their own page) are left untouched.
+async fn ensure_set_fk(pool: &PgPool, id: &str) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO sets (id, source_series, name, display_label)
-        VALUES ($1,$2,$3,$3)
-        ON CONFLICT DO NOTHING
+        VALUES ($1,$1,$1,$1)
+        ON CONFLICT (id) DO NOTHING
         "#,
     )
-    .bind(id)
-    .bind(placeholder_source_series)
     .bind(id)
     .execute(pool)
     .await?;
